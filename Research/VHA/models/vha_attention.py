@@ -93,24 +93,26 @@ class VHASelfAttention(SelfAttention):
         self.vha_enable_premix = getattr(config, "vha_enable_premix", True)
         self.vha_enable_postmix = getattr(config, "vha_enable_postmix", True)
         self.vha_postmix_rank = getattr(config, "vha_postmix_rank", 4)
-        premix_alpha_init = getattr(config, "vha_premix_alpha_init", 5.0)
+        self.vha_premix_init_alpha = getattr(config, "vha_premix_init_alpha", 0.1)
 
         # Head counts (per-partition for TP)
         H_k_local = self.num_query_groups_per_partition
         H_q_local = self.num_attention_heads_per_partition
         d = self.hidden_size_per_attention_head
 
-        # Premix: rotation matrices [H_k_local, d, d] with alpha gating
+        # Premix: rotation matrices [H_k_local, d, d] — directly applied to Q
+        # Initialized as I + alpha/sqrt(d) * randn (LD mode)
         if self.vha_enable_premix:
+            import math
+            alpha = self.vha_premix_init_alpha
+            I = paddle.eye(d)
+            init_mats = paddle.stack([
+                I + paddle.randn([d, d]) * (alpha / math.sqrt(d))
+                for _ in range(H_k_local)
+            ])
             self.vha_premix_weight = self.create_parameter(
                 shape=[H_k_local, d, d],
-                default_initializer=nn.initializer.Assign(
-                    paddle.eye(d).unsqueeze(0).expand([H_k_local, d, d])
-                ),
-            )
-            self.vha_premix_alpha = self.create_parameter(
-                shape=[H_k_local],
-                default_initializer=nn.initializer.Constant(premix_alpha_init),
+                default_initializer=nn.initializer.Assign(init_mats),
             )
 
         # Postmix: low-rank (I + VU^T) on attention output
@@ -143,18 +145,12 @@ class VHASelfAttention(SelfAttention):
         heads_per_group = H_q_local // H_k_local
         d = self.hidden_size_per_attention_head
 
-        # Effective premix: W_eff = I + sigmoid(alpha) * (W - I)
-        alpha = paddle.sigmoid(self.vha_premix_alpha)  # [H_k_local]
-        identity = paddle.eye(d).unsqueeze(0)  # [1, d, d]
-        w_eff = identity + alpha.reshape([-1, 1, 1]) * (self.vha_premix_weight - identity)
-        # w_eff: [H_k_local, d, d]
-
         # query: [b, sq, np, hn] -> [b, sq, H_k_local, heads_per_group, d]
         b, sq = query.shape[0], query.shape[1]
         q_grouped = query.reshape([b, sq, H_k_local, heads_per_group, d])
 
-        # Apply rotation per KV group
-        q_rotated = paddle.einsum("bsghd,gde->bsghe", q_grouped, w_eff)
+        # Apply rotation W per KV group: W @ q
+        q_rotated = paddle.einsum("bsghd,gde->bsghe", q_grouped, self.vha_premix_weight)
 
         return q_rotated.reshape([b, sq, H_q_local, d])
 
@@ -331,7 +327,7 @@ class VHASelfAttention(SelfAttention):
         """Return VHA-specific parameter groups for optimizer configuration."""
         groups = {"premix": [], "postmix": []}
         if self.vha_enable_premix:
-            groups["premix"] = [self.vha_premix_weight, self.vha_premix_alpha]
+            groups["premix"] = [self.vha_premix_weight]
         if self.vha_enable_postmix:
             groups["postmix"] = [self.vha_postmix_U, self.vha_postmix_V]
         return groups

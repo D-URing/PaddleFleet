@@ -16,6 +16,5 @@
   "use_qk_norm": true,
   "vha_enable_premix": true,
   "vha_enable_postmix": true,
-  "vha_postmix_rank": 4,
-  "vha_premix_alpha_init": 5.0
+  "vha_postmix_rank": 4
 }

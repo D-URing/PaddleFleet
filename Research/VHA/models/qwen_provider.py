@@ -133,7 +133,6 @@ class QwenVHAProvider(QwenDenseGQAProvider):
     vha_enable_premix: bool = True
     vha_enable_postmix: bool = True
     vha_postmix_rank: int = 4
-    vha_premix_alpha_init: float = 5.0
 
     def provide(self, pre_process=None, post_process=None, vp_stage=None, loss_fn=None):
         """Create GPT model with VHA attention layers."""
