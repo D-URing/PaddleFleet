@@ -55,15 +55,7 @@ from paddleformers.utils.log import logger
 
 os.environ["USE_CASUAL_MASK"] = "True"
 
-from models.qwen_provider import (
-    Qwen3GQA_0p6B,
-    Qwen3GQA_1p7B,
-    Qwen3GQA_1p7B_SingleCard,
-    Qwen3GQA_4B,
-    Qwen3VHA_0p6B,
-    Qwen3VHA_1p7B,
-    Qwen3VHA_4B,
-)
+from models.qwen_provider import create_provider
 from utils.warmup import VHAWarmupManager, init_vha_from_gqa_checkpoint
 
 from paddleformers.trainer.utils.doc import add_start_docstrings
@@ -88,10 +80,6 @@ class PreTrainingArguments(TrainingArguments):
     unified_checkpoint: bool = field(
         default=True,
         metadata={"help": "Enable unified checkpoint format."},
-    )
-    model_provider_type: str = field(
-        default="qwen_gqa_1p7B",
-        metadata={"help": "Name of the model provider."},
     )
     recompute: bool = field(
         default=False,
@@ -304,23 +292,6 @@ def _set_random_seed(seed_: int):
 
 
 # =============================================================================
-# Provider Registry
-# =============================================================================
-
-PROVIDER_REGISTRY = {
-    # GQA baselines
-    "qwen_gqa_0p6B": Qwen3GQA_0p6B,
-    "qwen_gqa_1p7B": Qwen3GQA_1p7B,
-    "qwen_gqa_4B": Qwen3GQA_4B,
-    "qwen_gqa_1p7B_single_card": Qwen3GQA_1p7B_SingleCard,
-    # VHA variants
-    "qwen_vha_0p6B": Qwen3VHA_0p6B,
-    "qwen_vha_1p7B": Qwen3VHA_1p7B,
-    "qwen_vha_4B": Qwen3VHA_4B,
-}
-
-
-# =============================================================================
 # Main
 # =============================================================================
 
@@ -364,19 +335,12 @@ def main():
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name_or_path)
 
-    # Model
-    provider_type = training_args.model_provider_type
-    if provider_type not in PROVIDER_REGISTRY:
-        raise ValueError(
-            f"Unknown model_provider_type: {provider_type}. "
-            f"Available: {list(PROVIDER_REGISTRY.keys())}"
-        )
-
-    model_provider = PROVIDER_REGISTRY[provider_type]()
+    # Model — load architecture from config.json
+    model_provider = create_provider(model_args.model_name_or_path)
     model_provider.seq_length = data_args.max_seq_length
     model_provider.max_sequence_length = data_args.max_seq_length
 
-    logger.info(f"Creating model with provider: {provider_type}")
+    logger.info(f"Creating model from: {model_args.model_name_or_path}")
     model = model_provider.provide()
 
     if training_args.recompute:
@@ -384,7 +348,7 @@ def main():
 
     # VHA warm-up
     warmup_manager = None
-    is_vha_model = "vha" in provider_type
+    is_vha_model = model_provider.attn_type == "vha"
 
     if is_vha_model:
         if vha_args.vha_warmup_from_gqa is not None:
@@ -392,7 +356,7 @@ def main():
             init_vha_from_gqa_checkpoint(
                 model,
                 gqa_checkpoint_dir=vha_args.vha_warmup_from_gqa,
-                alpha_init=model_provider.vha_premix_alpha_init,
+                alpha_init=model_provider.vha_premix_init_alpha,
             )
 
         warmup_manager = VHAWarmupManager(

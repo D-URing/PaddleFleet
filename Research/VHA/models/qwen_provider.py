@@ -15,12 +15,18 @@
 """
 Qwen model providers for VHA training.
 
-Provides both GQA baseline and VHA variants as GPTModelProvider subclasses.
-GQA uses standard gpt_builder, VHA uses vha_gpt_builder.
+Dynamic config loading: all architecture parameters are read from
+config/qwen3/<model>/config.json, not hardcoded in provider classes.
+
+Usage:
+    provider = create_provider(model_name_or_path="./config/qwen3/Qwen3-1.7B-VHA")
+    model = provider.provide()
 """
 
+import json
 import logging
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, fields
 from typing import Callable, Optional
 
 import paddle
@@ -35,13 +41,18 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# GQA Baseline Providers
+# Base Provider (shared defaults for Qwen3 family)
 # =============================================================================
 
 @dataclass
-class QwenDenseGQAProvider(GPTModelProvider):
-    """Base provider for Qwen3-style Dense GQA models."""
+class QwenBaseProvider(GPTModelProvider):
+    """
+    Base provider with Qwen3 defaults.
+    Architecture-specific params (hidden_size, num_heads, etc.) are loaded
+    dynamically from config.json via load_config().
+    """
 
+    # --- Qwen3 family defaults (rarely change across sizes) ---
     normalization: str = "RMSNorm"
     hidden_act: Callable = F.silu
     gated_linear_unit: bool = True
@@ -73,69 +84,55 @@ class QwenDenseGQAProvider(GPTModelProvider):
     bias_activation_fusion: bool = True
     bias_dropout_fusion: bool = True
 
-
-@dataclass
-class Qwen3GQA_0p6B(QwenDenseGQAProvider):
-    """Qwen3-0.6B: 28 layers, hidden=1024, 16 Q heads, 2 KV heads."""
-    num_hidden_layers: int = 28
-    hidden_size: int = 1024
-    num_attention_heads: int = 16
-    num_key_value_heads: int = 2
-    intermediate_size: int = 3072
-
-
-@dataclass
-class Qwen3GQA_1p7B(QwenDenseGQAProvider):
-    """Qwen3-1.7B: 28 layers, hidden=2048, 16 Q heads, 2 KV heads."""
-    num_hidden_layers: int = 28
+    # --- Architecture params (overridden by config.json) ---
     hidden_size: int = 2048
     num_attention_heads: int = 16
     num_key_value_heads: int = 2
+    num_hidden_layers: int = 28
     intermediate_size: int = 6144
 
-
-@dataclass
-class Qwen3GQA_4B(QwenDenseGQAProvider):
-    """Qwen3-4B: 36 layers, hidden=2560, 32 Q heads, 4 KV heads."""
-    num_hidden_layers: int = 36
-    hidden_size: int = 2560
-    num_attention_heads: int = 32
-    num_key_value_heads: int = 4
-    intermediate_size: int = 9216
-    tie_word_embeddings: Optional[bool] = False
-
-
-@dataclass
-class Qwen3GQA_1p7B_SingleCard(QwenDenseGQAProvider):
-    """Debug: small Qwen3-1.7B for single-card testing."""
-    num_hidden_layers: int = 4
-    hidden_size: int = 2048
-    num_attention_heads: int = 16
-    num_key_value_heads: int = 2
-    intermediate_size: int = 6144
-    seq_length: int = 2048
-
-
-# =============================================================================
-# VHA Providers
-# =============================================================================
-
-@dataclass
-class QwenVHAProvider(QwenDenseGQAProvider):
-    """
-    Provider for Qwen + VHA attention.
-
-    Creates a GPT model with VHA attention layers using PaddleFleet native
-    components. All transformer layers use VHASelfAttention.
-    """
-
-    # VHA-specific config
+    # --- VHA params (only used when attn_type == "vha") ---
     vha_enable_premix: bool = True
     vha_enable_postmix: bool = True
     vha_postmix_rank: int = 4
+    vha_premix_init_alpha: float = 0.1
+
+    # --- Internal ---
+    attn_type: str = "gqa"  # "gqa" or "vha"
+
+    def load_config(self, model_name_or_path: str):
+        """
+        Load architecture parameters from config.json and override dataclass fields.
+        """
+        config_path = os.path.join(model_name_or_path, "config.json")
+        if not os.path.isfile(config_path):
+            raise FileNotFoundError(f"Config not found: {config_path}")
+
+        with open(config_path, "r") as f:
+            cfg = json.load(f)
+
+        # Map config.json keys to dataclass fields
+        field_names = {fld.name for fld in fields(self)}
+        key_mapping = {
+            "rms_norm_eps": "layernorm_epsilon",
+        }
+
+        for k, v in cfg.items():
+            mapped_k = key_mapping.get(k, k)
+            if mapped_k in field_names:
+                setattr(self, mapped_k, v)
+
+        logger.info(
+            f"Loaded config from {config_path}: "
+            f"attn_type={self.attn_type}, "
+            f"hidden_size={self.hidden_size}, "
+            f"num_heads={self.num_attention_heads}, "
+            f"num_kv_heads={self.num_key_value_heads}, "
+            f"layers={self.num_hidden_layers}"
+        )
 
     def provide(self, pre_process=None, post_process=None, vp_stage=None, loss_fn=None):
-        """Create GPT model with VHA attention layers."""
+        """Create GPT model. Uses vha_gpt_builder for VHA, gpt_builder for GQA."""
         pp_size = self.pipeline_model_parallel_size
 
         if hasattr(self, "rope_parameters") and self.rope_parameters:
@@ -145,44 +142,34 @@ class QwenVHAProvider(QwenDenseGQAProvider):
             if "rope_theta" in self.rope_parameters:
                 self.rope_theta = self.rope_parameters["rope_theta"]
 
-        model = vha_gpt_builder(
-            self,
-            num_stages=pp_size,
-            seg_method="layer:TransformerLayer|EmptyLayer",
-            loss_fn=loss_fn,
-        )
+        if self.attn_type == "vha":
+            model = vha_gpt_builder(
+                self,
+                num_stages=pp_size,
+                seg_method="layer:TransformerLayer|EmptyLayer",
+                loss_fn=loss_fn,
+            )
+        else:
+            model = gpt_builder(
+                self,
+                num_stages=pp_size,
+                seg_method="layer:TransformerLayer|EmptyLayer",
+                loss_fn=loss_fn,
+            )
+
         return model
 
 
-@dataclass
-class Qwen3VHA_0p6B(QwenVHAProvider):
-    """Qwen3-0.6B + VHA: 28 layers, hidden=1024, 16 Q heads, 2 KV heads."""
-    num_hidden_layers: int = 28
-    hidden_size: int = 1024
-    num_attention_heads: int = 16
-    num_key_value_heads: int = 2
-    intermediate_size: int = 3072
-    vha_postmix_rank: int = 4
+def create_provider(model_name_or_path: str) -> QwenBaseProvider:
+    """
+    Factory function: create a provider with config loaded from model_name_or_path.
 
+    Args:
+        model_name_or_path: path to directory containing config.json
 
-@dataclass
-class Qwen3VHA_1p7B(QwenVHAProvider):
-    """Qwen3-1.7B + VHA: 28 layers, hidden=2048, 16 Q heads, 2 KV heads."""
-    num_hidden_layers: int = 28
-    hidden_size: int = 2048
-    num_attention_heads: int = 16
-    num_key_value_heads: int = 2
-    intermediate_size: int = 6144
-    vha_postmix_rank: int = 4
-
-
-@dataclass
-class Qwen3VHA_4B(QwenVHAProvider):
-    """Qwen3-4B + VHA: 36 layers, hidden=2560, 32 Q heads, 4 KV heads."""
-    num_hidden_layers: int = 36
-    hidden_size: int = 2560
-    num_attention_heads: int = 32
-    num_key_value_heads: int = 4
-    intermediate_size: int = 9216
-    tie_word_embeddings: Optional[bool] = False
-    vha_postmix_rank: int = 4
+    Returns:
+        QwenBaseProvider with all architecture params loaded from config.
+    """
+    provider = QwenBaseProvider()
+    provider.load_config(model_name_or_path)
+    return provider
