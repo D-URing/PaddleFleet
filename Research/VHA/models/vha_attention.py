@@ -16,15 +16,21 @@
 VHA Self-Attention layer built on PaddleFleet native components.
 
 Extends PaddleFleet's SelfAttention with:
-  - Premix: per-KV-group rotation matrices [H_k, d, d] applied to Q after QKV projection
-  - Postmix: low-rank (I + VU^T) cross-head mixing applied to attention output
+  - Premix: W[H_k, d, d] expands Q from H_q heads to H_k*H_q virtual heads
+  - Postmix: low-rank UV cross-head mixing on expanded attention output
 
 Uses PaddleFleet's ColumnParallelLinear (QKV), RowParallelLinear (O),
 and DotProductAttention (core attention) — fully compatible with TP/PP/SP.
+
+Architecture:
+  num_attention_heads (config) = H_q = pre-expansion Q head count
+  num_key_value_heads (config) = H_k = KV head count
+  total_heads = H_k * H_q = expanded virtual head count after premix
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -57,18 +63,20 @@ class VHASelfAttention(SelfAttention):
 
     Architecture:
         1. QKV projection (fused, ColumnParallelLinear) — inherited
+           Q: [B, T, H_q_local, d], K: [B, T, H_k_local, d], V: [B, T, H_k_local, d]
         2. QK norm — inherited
-        3. **Premix**: per-KV-group rotation on Q heads (VHA-specific)
-        4. RoPE — inherited
-        5. Core attention (DotProductAttention) — inherited
-        6. **Postmix**: low-rank cross-head mixing on attention output (VHA-specific)
-        7. Output projection (RowParallelLinear) — inherited
+        3. **Premix**: W[H_k, d, d] expands Q from H_q to H_k*H_q virtual heads
+           Q: [B, T, H_q_local, d] -> [B, T, H_k_local*H_q_local, d]
+        4. RoPE — on expanded Q and original K
+        5. Core attention (DotProductAttention) — K/V internally repeated by factor H_q
+        6. **Postmix**: low-rank UV cross-head mixing on H_k*H_q expanded output
+        7. Output projection (RowParallelLinear) — input dim = H_k*H_q*d
 
     VHA config fields (read from TransformerConfig):
         - vha_enable_premix: bool (default True)
         - vha_enable_postmix: bool (default True)
         - vha_postmix_rank: int (default 4)
-        - vha_premix_alpha_init: float (default 5.0)
+        - vha_premix_init_alpha: float (default 0.1)
     """
 
     def __init__(
@@ -96,14 +104,43 @@ class VHASelfAttention(SelfAttention):
         self.vha_premix_init_alpha = getattr(config, "vha_premix_init_alpha", 0.1)
 
         # Head counts (per-partition for TP)
-        H_k_local = self.num_query_groups_per_partition
-        H_q_local = self.num_attention_heads_per_partition
+        H_k_local = self.num_query_groups_per_partition   # H_k / tp
+        H_q_local = self.num_attention_heads_per_partition  # H_q / tp
         d = self.hidden_size_per_attention_head
+        total_heads_local = H_k_local * H_q_local  # expanded virtual heads per partition
 
-        # Premix: rotation matrices [H_k_local, d, d] — directly applied to Q
+        self.total_heads_local = total_heads_local
+
+        # --- Override core_attention head counts for correct K/V expansion ---
+        # After premix, Q has total_heads_local heads. K/V have H_k_local heads.
+        # We need core_attention to repeat K/V by factor total_heads_local / H_k_local = H_q_local.
+        # Original config gives repeat factor = H_q_local / H_k_local (wrong for expanded Q).
+        # Override to: num_attention_heads_per_partition = total_heads_local, keeping
+        # num_query_groups_per_partition = H_k_local (unchanged).
+        self.core_attention.num_attention_heads_per_partition = total_heads_local
+        # num_query_groups_per_partition stays H_k_local (already correct from config)
+
+        # --- Rebuild o_proj with correct input dimension ---
+        # After expansion, attention output has total_heads * d dimensions.
+        # Original o_proj expects H_q * d. We need H_k * H_q * d.
+        total_query_projection_size = (
+            config.num_key_value_heads * config.num_attention_heads * d
+        )
+        self.o_proj = build_spec_layer(
+            sublayers_spec.o_proj,
+            total_query_projection_size,
+            self.config.hidden_size,
+            config=self.config,
+            init_method=self.config.output_layer_init_method,
+            bias=self.config.use_bias,
+            input_is_parallel=True,
+            skip_bias_add=True,
+            is_expert=False,
+        )
+
+        # --- Premix: W[H_k_local, d, d] ---
         # Initialized as I + alpha/sqrt(d) * randn (LD mode)
         if self.vha_enable_premix:
-            import math
             alpha = self.vha_premix_init_alpha
             I = paddle.eye(d)
             init_mats = paddle.stack([
@@ -115,51 +152,52 @@ class VHASelfAttention(SelfAttention):
                 default_initializer=nn.initializer.Assign(init_mats),
             )
 
-        # Postmix: low-rank (I + VU^T) on attention output
+        # --- Postmix: UV low-rank on expanded heads ---
+        # U, V: [total_heads_local, r]
         if self.vha_enable_postmix:
             r = self.vha_postmix_rank
             self.vha_postmix_U = self.create_parameter(
-                shape=[H_q_local, r],
+                shape=[total_heads_local, r],
                 default_initializer=nn.initializer.Normal(mean=0.0, std=0.01),
             )
             self.vha_postmix_V = self.create_parameter(
-                shape=[H_q_local, r],
+                shape=[total_heads_local, r],
                 default_initializer=nn.initializer.Constant(0.0),
             )
 
     def _apply_premix(self, query: Tensor) -> Tensor:
         """
-        Apply premix rotation to query tensor.
+        Expand Q from H_q heads to H_k*H_q virtual heads via premix weight.
 
         Args:
-            query: [b, sq, np, hn] where np = H_q_local, hn = head_dim
+            query: [b, sq, H_q_local, d]
 
         Returns:
-            query with premix applied: same shape
+            expanded query: [b, sq, H_k_local * H_q_local, d]
+
+        Operation:
+            einsum("bthd,kde->btkhe", Q[B,T,H_q,d], W[H_k,d,d])
+            -> [B, T, H_k, H_q, d] -> reshape [B, T, H_k*H_q, d]
         """
         if not self.vha_enable_premix:
             return query
 
-        H_k_local = self.num_query_groups_per_partition
-        H_q_local = self.num_attention_heads_per_partition
-        heads_per_group = H_q_local // H_k_local
-        d = self.hidden_size_per_attention_head
-
-        # query: [b, sq, np, hn] -> [b, sq, H_k_local, heads_per_group, d]
+        # query: [b, sq, H_q_local, d]
+        # vha_premix_weight: [H_k_local, d, d]
+        # Result: [b, sq, H_k_local, H_q_local, d]
+        q_expanded = paddle.einsum(
+            "bthd,kde->btkhe", query, self.vha_premix_weight
+        )
+        # Reshape to [b, sq, H_k_local * H_q_local, d]
         b, sq = query.shape[0], query.shape[1]
-        q_grouped = query.reshape([b, sq, H_k_local, heads_per_group, d])
-
-        # Apply rotation W per KV group: W @ q
-        q_rotated = paddle.einsum("bsghd,gde->bsghe", q_grouped, self.vha_premix_weight)
-
-        return q_rotated.reshape([b, sq, H_q_local, d])
+        return q_expanded.reshape([b, sq, self.total_heads_local, self.hidden_size_per_attention_head])
 
     def _apply_postmix(self, attn_out: Tensor) -> Tensor:
         """
-        Apply postmix low-rank cross-head mixing to attention output.
+        Apply postmix low-rank UV cross-head mixing on expanded attention output.
 
         Args:
-            attn_out: [b, sq, h] where h = H_q_local * head_dim
+            attn_out: [b, sq, total_heads_local * d] (flattened)
 
         Returns:
             attn_out with postmix applied: same shape
@@ -167,19 +205,20 @@ class VHASelfAttention(SelfAttention):
         if not self.vha_enable_postmix:
             return attn_out
 
-        H_q_local = self.num_attention_heads_per_partition
         d = self.hidden_size_per_attention_head
         b, sq, _ = attn_out.shape
 
-        # Reshape to [b, sq, H_q_local, d]
-        x = attn_out.reshape([b, sq, H_q_local, d])
+        # Reshape to [b, sq, total_heads_local, d]
+        x = attn_out.reshape([b, sq, self.total_heads_local, d])
 
-        # Low-rank mixing: delta = (x @ U) @ V^T in head dimension
-        Z = paddle.einsum("bshd,hr->bsrd", x, self.vha_postmix_U)
-        delta = paddle.einsum("bsrd,hr->bshd", Z, self.vha_postmix_V)
+        # UV mixing: delta = V @ (U^T @ x) in head dimension
+        # Z = einsum("bthd,hr->btrd", x, U)  -> [b, sq, r, d]
+        # delta = einsum("btrd,hr->bthd", Z, V) -> [b, sq, total_heads_local, d]
+        Z = paddle.einsum("bthd,hr->btrd", x, self.vha_postmix_U)
+        delta = paddle.einsum("btrd,hr->bthd", Z, self.vha_postmix_V)
 
         x = x + delta
-        return x.reshape([b, sq, H_q_local * d])
+        return x.reshape([b, sq, self.total_heads_local * d])
 
     def forward(
         self,
@@ -197,7 +236,7 @@ class VHASelfAttention(SelfAttention):
         in_recompute: bool = False,
     ) -> tuple[Tensor, Tensor]:
         """
-        VHA forward: QKV -> premix on Q -> RoPE -> core attention -> postmix -> O proj.
+        VHA forward: QKV -> premix (expand Q) -> RoPE -> core attention -> postmix -> O proj.
         """
         from paddle.distributed.fleet.utils import recompute
         from paddlefleet.models.common.embeddings import apply_rotary_pos_emb
@@ -205,11 +244,10 @@ class VHASelfAttention(SelfAttention):
             _yarn_get_concentration_factor_from_config,
         )
 
-        no_rope = False
         if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
             rotary_pos_emb = (rotary_pos_emb,) * 2
 
-        # QKV projection
+        # QKV projection: Q[B,T,H_q_local,d], K[B,T,H_k_local,d], V[B,T,H_k_local,d]
         qkv_output = self.get_query_key_value_tensors(
             hidden_states, key_value_states, split_qkv=True
         )
@@ -221,10 +259,10 @@ class VHASelfAttention(SelfAttention):
             query, key, value = qkv_output
             gate = None
 
-        # Premix on Q
+        # Premix: expand Q from [B,T,H_q_local,d] to [B,T,H_k_local*H_q_local,d]
         query = self._apply_premix(query)
 
-        # RoPE
+        # RoPE (applied on expanded Q and original K)
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
@@ -281,6 +319,8 @@ class VHASelfAttention(SelfAttention):
                     )
 
         # Core attention
+        # Q: [B, T, total_heads_local, d], K: [B, T, H_k_local, d], V: [B, T, H_k_local, d]
+        # core_attention internally repeats K/V by factor total_heads_local / H_k_local = H_q_local
         if self.config.sequence_parallel:
             query = query.transpose([1, 0, 2, 3]).contiguous()
             key = key.transpose([1, 0, 2, 3]).contiguous()
@@ -315,10 +355,10 @@ class VHASelfAttention(SelfAttention):
         if gate is not None:
             core_attn_out = core_attn_out * paddle.nn.functional.sigmoid(gate)
 
-        # Postmix
+        # Postmix on expanded heads
         core_attn_out = self._apply_postmix(core_attn_out)
 
-        # Output projection
+        # Output projection (input dim = total_heads * d = H_k * H_q * d)
         output, bias = self.o_proj(core_attn_out)
 
         return output, bias
