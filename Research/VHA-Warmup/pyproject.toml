@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vha-warmup"
+version = "0.0.1"
+description = "GQA to VHA conversion: weight initialization and warm-up training."
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[tool.setuptools.packages.find]
+include = ["vha_warmup*"]
