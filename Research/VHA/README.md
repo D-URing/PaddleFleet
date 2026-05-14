@@ -9,9 +9,8 @@ Research/VHA/
 ├── run_pretrain.py              # Training entry point
 ├── models/                      # Model implementations
 │   ├── vha_attention.py         # VHASelfAttention (extends PaddleFleet SelfAttention)
-│   ├── vha_layer_specs.py       # VHA transformer layer specification
-│   ├── vha_builder.py           # VHA model builder (parallels gpt_builder)
-│   └── qwen_provider.py        # GQA + VHA model providers (0.6B/1.7B/4B)
+│   ├── vha_builder.py           # VHA layer spec + model builder
+│   └── qwen_provider.py        # Dynamic config provider (GQA/VHA)
 ├── utils/                       # Utilities
 │   └── warmup.py               # VHA warmup manager + GQA checkpoint conversion
 ├── config/                      # Configurations
