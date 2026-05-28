@@ -194,6 +194,12 @@ class TransformerConfig(ModelParallelConfig):
     """Scale factor applied to the value tensor before attention computation. If None, no scaling
     is applied. Used in architectures like MiMo that scale V for training stability."""
 
+    use_vha_attention: bool = False
+    """If True, enables VHA premix/postmix extensions in standard self-attention."""
+
+    vha_postmix_rank: int = 4
+    """Rank of the VHA postmix low-rank head mixing matrices."""
+
     add_full_attention_sink_bias: bool = False
     """Whether to add a learnable attention sink bias for full (non-SWA) attention layers.
     When True, softmax_type is promoted to 'learnable' for full attention layers."""
