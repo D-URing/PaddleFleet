@@ -2,7 +2,7 @@
   "architectures": ["Qwen3ForCausalLM"],
   "attn_type": "vha",
   "hidden_size": 2048,
-  "num_attention_heads": 16,
+  "num_attention_heads": 8,
   "num_key_value_heads": 2,
   "num_hidden_layers": 4,
   "intermediate_size": 6144,

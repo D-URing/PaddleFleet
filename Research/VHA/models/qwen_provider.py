@@ -97,6 +97,11 @@ class QwenBaseProvider(GPTModelProvider):
     vha_postmix_rank: int = 4
     vha_premix_init_alpha: float = 0.1
 
+    # --- Loss computation ---
+    # Chunk the sequence dimension when computing cross-entropy loss to avoid
+    # materializing a full [B, S, V] float32 tensor (~10GB for vocab=151936).
+    loss_subbatch_sequence_length: int = 1024
+
     # --- Internal ---
     attn_type: str = "gqa"  # "gqa" or "vha"
 
@@ -116,10 +121,18 @@ class QwenBaseProvider(GPTModelProvider):
         key_mapping = {
             "rms_norm_eps": "layernorm_epsilon",
         }
+        # Map activation name strings to callables
+        act_mapping = {
+            "silu": F.silu,
+            "gelu": F.gelu,
+            "relu": F.relu,
+        }
 
         for k, v in cfg.items():
             mapped_k = key_mapping.get(k, k)
             if mapped_k in field_names:
+                if mapped_k == "hidden_act" and isinstance(v, str):
+                    v = act_mapping.get(v, v)
                 setattr(self, mapped_k, v)
 
         logger.info(

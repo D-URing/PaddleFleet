@@ -132,14 +132,29 @@ def init_vha_from_gqa_checkpoint(
 
 class VHAWarmupManager:
     """
-    Manages VHA warm-up training phases.
+    Manages VHA warm-up training phases with progressive unfreezing.
+
+    Strategy: The initial loss spike comes from KV compression (8→2 heads).
+    Phase 0 lets the attention layers (qkv_proj + o_proj + VHA params) adapt
+    to the new KV structure while keeping MLP/embeddings frozen. This directly
+    targets the information bottleneck.
 
     Phases:
-        0 (stabilize): VHA params (premix/postmix) frozen, only backbone trains.
-        1 (activate):  All parameters unfrozen, full training.
+        0 (attn-adapt): Only attention params train (qkv_proj, o_proj, premix, postmix).
+           MLP, embeddings, layernorm frozen. Lets the model quickly learn
+           the optimal 2-head KV representation.
+        1 (full with lr_scale): All params unfreeze, premix/postmix use lr_scale.
+        2 (full): All parameters at full learning rate.
+
+    Phase transitions:
+        step < stabilize_steps          -> phase 0
+        stabilize_steps <= step < stabilize_steps + postmix_warmup_steps -> phase 1
+        step >= stabilize_steps + postmix_warmup_steps -> phase 2
+
+    If postmix_warmup_steps == 0, skips phase 1.
 
     Usage:
-        warmup_mgr = VHAWarmupManager(model, stabilize_steps=500)
+        warmup_mgr = VHAWarmupManager(model, stabilize_steps=500, postmix_warmup_steps=1000)
         for step in range(max_steps):
             warmup_mgr.step(step)
             loss = train_step(model, batch)
@@ -149,11 +164,13 @@ class VHAWarmupManager:
         self,
         model,
         stabilize_steps: int = 0,
+        postmix_warmup_steps: int = 0,
         premix_lr_scale: float = 1.0,
         postmix_lr_scale: float = 1.0,
     ):
         self.model = model
         self.stabilize_steps = stabilize_steps
+        self.postmix_warmup_steps = postmix_warmup_steps
         self.premix_lr_scale = premix_lr_scale
         self.postmix_lr_scale = postmix_lr_scale
         self._current_phase = -1
@@ -162,27 +179,79 @@ class VHAWarmupManager:
         if not self._vha_layers:
             logger.warning("No VHASelfAttention layers found. WarmupManager is a no-op.")
 
+        # Identify attention projection params (qkv_proj, o_proj) by name
+        self._attn_proj_ids = set()
+        for name, param in model.named_parameters():
+            if "qkv_proj" in name or "o_proj" in name:
+                self._attn_proj_ids.add(id(param))
+
+    def _get_phase(self, global_step: int) -> int:
+        """Determine phase based on step."""
+        if self.stabilize_steps > 0 and global_step < self.stabilize_steps:
+            return 0
+        elif self.postmix_warmup_steps > 0 and global_step < self.stabilize_steps + self.postmix_warmup_steps:
+            return 1
+        else:
+            return 2
+
     def step(self, global_step: int):
         """Call each training step to manage phase transitions."""
-        if self.stabilize_steps > 0 and global_step < self.stabilize_steps:
-            if self._current_phase != 0:
-                self._enter_phase(0)
-        else:
-            if self._current_phase != 1:
-                self._enter_phase(1)
+        phase = self._get_phase(global_step)
+        if phase != self._current_phase:
+            self._enter_phase(phase)
 
     def _enter_phase(self, phase: int):
         self._current_phase = phase
         if phase == 0:
-            logger.info("VHA Warmup: phase 0 (stabilize) — VHA params frozen")
+            logger.info(
+                "VHA Warmup: phase 0 (attn-adapt) — "
+                "qkv_proj + o_proj + VHA params train, rest frozen"
+            )
+            # Train: qkv_proj, o_proj, premix, postmix
+            # Freeze: MLP, embeddings, layernorm
+            trainable_ids = set(self._attn_proj_ids)
             for layer in self._vha_layers:
                 for p in layer.vha_param_groups()["premix"] + layer.vha_param_groups()["postmix"]:
-                    p.stop_gradient = True
-        elif phase == 1:
-            logger.info("VHA Warmup: phase 1 (activate) — all params unfrozen")
-            for layer in self._vha_layers:
-                for p in layer.vha_param_groups()["premix"] + layer.vha_param_groups()["postmix"]:
+                    trainable_ids.add(id(p))
+                    p.optimize_attr = {"learning_rate": 1.0}
+            for p in self.model.parameters():
+                if id(p) in trainable_ids:
                     p.stop_gradient = False
+                    p.optimize_attr = {"learning_rate": 1.0}
+                else:
+                    p.stop_gradient = True
+                    if hasattr(p, "clear_gradient"):
+                        p.clear_gradient()
+                    p.optimize_attr = {"learning_rate": 0.0}
+            logger.info(
+                f"  Trainable params: {len(trainable_ids)} "
+                f"(attn_proj={len(self._attn_proj_ids)}, "
+                f"vha={len(trainable_ids) - len(self._attn_proj_ids)})"
+            )
+        elif phase == 1:
+            logger.info("VHA Warmup: phase 1 (full with lr_scale) — all params train")
+            # Restore all params, apply premix/postmix scales
+            premix_ids = set()
+            postmix_ids = set()
+            for layer in self._vha_layers:
+                groups = layer.vha_param_groups()
+                for p in groups["premix"]:
+                    premix_ids.add(id(p))
+                for p in groups["postmix"]:
+                    postmix_ids.add(id(p))
+            for p in self.model.parameters():
+                p.stop_gradient = False
+                if id(p) in premix_ids:
+                    p.optimize_attr = {"learning_rate": self.premix_lr_scale}
+                elif id(p) in postmix_ids:
+                    p.optimize_attr = {"learning_rate": self.postmix_lr_scale}
+                else:
+                    p.optimize_attr = {"learning_rate": 1.0}
+        elif phase == 2:
+            logger.info("VHA Warmup: phase 2 (full) — all params full lr")
+            for p in self.model.parameters():
+                p.stop_gradient = False
+                p.optimize_attr = {"learning_rate": 1.0}
 
     def get_vha_param_groups(self, base_lr: float) -> list[dict]:
         """Return VHA parameter groups with per-group LR for optimizer."""

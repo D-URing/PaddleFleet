@@ -23,7 +23,6 @@ Supports:
   - Distributed training (TP/PP/DP via PaddleFleet)
 """
 
-import math
 import os
 import random
 import sys
@@ -37,7 +36,6 @@ import paddlefleet
 
 from paddleformers.data.causal_dataset import (
     build_train_valid_test_datasets,
-    check_data_split,
     print_rank_0,
 )
 from paddleformers.trainer import (
@@ -45,7 +43,6 @@ from paddleformers.trainer import (
     StepFlexToken,
     TrainingArguments,
     get_last_checkpoint,
-    speed_metrics,
 )
 from paddleformers.trainer.trainer import Trainer
 from paddleformers.transformers import AutoTokenizer
@@ -95,7 +92,6 @@ class DataArguments:
     input_dir: str = field(
         default=None, metadata={"help": "Path to training data directory."}
     )
-    split: str = field(default="998,1,1", metadata={"help": "Train/valid/test split."})
     max_seq_length: int = field(
         default=4096, metadata={"help": "Maximum sequence length."}
     )
@@ -127,6 +123,7 @@ class VHAArguments:
         default=None,
         metadata={"help": "Path to GQA checkpoint for VHA warm-up initialization."},
     )
+
     vha_stabilize_steps: int = field(
         default=0,
         metadata={"help": "Steps to keep VHA params frozen during warm-up."},
@@ -146,30 +143,22 @@ class VHAArguments:
 # =============================================================================
 
 def create_pretrained_dataset(data_args, training_args, data_file, tokenizer, need_data=True):
-    check_data_split(data_args.split, training_args.do_train, training_args.do_eval, training_args.do_predict)
-
     train_val_test_num_samples = [
         training_args.per_device_train_batch_size
         * training_args.dataset_world_size
         * training_args.max_steps
         * training_args.gradient_accumulation_steps,
-        training_args.per_device_eval_batch_size
-        * training_args.dataset_world_size
-        * training_args.eval_iters
-        * (training_args.max_steps // training_args.eval_steps + 1),
-        training_args.per_device_eval_batch_size * training_args.dataset_world_size * training_args.test_iters,
+        0,
+        0,
     ]
 
     print_rank_0(" > datasets target sizes (minimum size):")
-    if training_args.do_train:
-        print_rank_0("    train:      {}".format(train_val_test_num_samples[0]))
-    if training_args.do_eval:
-        print_rank_0("    validation: {}".format(train_val_test_num_samples[1]))
+    print_rank_0("    train:      {}".format(train_val_test_num_samples[0]))
 
     train_dataset, valid_dataset, test_dataset = build_train_valid_test_datasets(
         data_prefix=data_file,
         data_impl=data_args.data_impl,
-        splits_string=data_args.split,
+        splits_string="1,0,0",
         train_val_test_num_samples=train_val_test_num_samples,
         seq_length=data_args.max_seq_length,
         seed=training_args.seed,
@@ -225,44 +214,6 @@ class PretrainingTrainer(Trainer):
         if self.warmup_manager is not None:
             self.warmup_manager.step(self.state.global_step)
         return super().training_step(model, inputs)
-
-    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix: str = "eval"):
-        eval_dataloader = getattr(self, "eval_dataloader", None)
-        if eval_dataloader is None:
-            eval_dataset = self.eval_dataset if eval_dataset is None else eval_dataset
-            eval_dataloader = self.get_eval_dataloader(eval_dataset)
-            self.eval_dataloader = eval_dataloader()
-
-        start_time = time.time()
-        output = self.evaluation_loop(
-            eval_dataloader,
-            description="Evaluation",
-            prediction_loss_only=True if self.compute_metrics is None else None,
-            ignore_keys=ignore_keys,
-            max_eval_iters=self.args.eval_iters,
-        )
-
-        total_batch_size = self.args.eval_batch_size * self.args.world_size
-        output.metrics.update(
-            speed_metrics(
-                metric_key_prefix, start_time,
-                num_samples=output.num_samples,
-                num_steps=math.ceil(output.num_samples / total_batch_size),
-            )
-        )
-        self.log(output.metrics)
-        self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, output.metrics)
-        return output.metrics
-
-    def _get_eval_sampler(self, eval_dataset):
-        return DistributedBatchSampler(
-            eval_dataset,
-            batch_size=self.args.per_device_eval_batch_size,
-            shuffle=False,
-            num_replicas=self.args.dataset_world_size,
-            rank=self.args.dataset_rank,
-            drop_last=self.args.dataloader_drop_last,
-        )
 
     def _get_train_sampler(self):
         return DistributedBatchSampler(
@@ -344,7 +295,10 @@ def main():
     model = model_provider.provide()
 
     if training_args.recompute:
-        model.recompute_enable()
+        def _enable_recompute(layer):
+            if hasattr(layer, "enable_recompute") and not layer.enable_recompute:
+                layer.enable_recompute = True
+        model.apply(_enable_recompute)
 
     # VHA warm-up
     warmup_manager = None
@@ -375,7 +329,7 @@ def main():
 
     # Data
     data_file = get_train_data_file(data_args)
-    train_dataset, eval_dataset, test_dataset, data_collator = create_pretrained_dataset(
+    train_dataset, _, _, data_collator = create_pretrained_dataset(
         data_args, training_args, data_file, tokenizer,
         need_data=training_args.should_load_dataset,
     )
@@ -396,7 +350,6 @@ def main():
         args=training_args,
         data_collator=data_collator,
         train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
         optimizers=(None, None),
         tokenizer=tokenizer,
         callbacks=callbacks,
@@ -418,10 +371,6 @@ def main():
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         trainer.save_state()
-
-    if training_args.do_predict:
-        test_ret = trainer.predict(test_dataset)
-        trainer.log_metrics("test", test_ret.metrics)
 
     if training_args.do_train and training_args.should_load_dataset:
         effective_tokens_per_second = total_effective_tokens / train_result.metrics["train_runtime"]

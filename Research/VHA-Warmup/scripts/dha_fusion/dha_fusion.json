@@ -1,0 +1,35 @@
+{
+  "_comment": "DHA-style fusion training: GQA(8KV) -> VHA(2KV+postmix). 2000 steps, constant LR=1e-5, ALM constraint.",
+
+  "gqa_checkpoint": "/root/paddlejob/share-storage/gpfs/system-public/dingxibo/PaddleFleet/Research/VHA/output/qwen3_gqa_1p7B_pretrain/checkpoint-24000/model_state_merged",
+  "gqa_model_config": "/root/paddlejob/share-storage/gpfs/system-public/dingxibo/PaddleFleet/Research/VHA/config/qwen3/Qwen3-1.7B-GQA",
+  "groupings_path": "/root/paddlejob/share-storage/gpfs/system-public/dingxibo/PaddleFleet/Research/VHA-Warmup/output/qwen3_vha_1p7B_kv_postmix_activation_128/conversion_diagnostics.json",
+  "output_path": "/root/paddlejob/share-storage/gpfs/system-public/dingxibo/PaddleFleet/Research/VHA-Warmup/output/qwen3_vha_1p7B_dha_fusion/run01",
+
+  "data_path": "/root/paddlejob/share-storage/gpfs/system-public/dingxibo/datasets/fineweb-edu/qwen",
+  "num_samples": 65536,
+  "seq_length": 4096,
+
+  "max_steps": 2000,
+  "lr": 1e-5,
+  "grad_clip": 1.0,
+  "weight_decay": 0.0,
+  "adam_beta2": 0.95,
+  "batch_size": 4,
+  "grad_accum": 1,
+
+  "fusion_decay_steps": 1500,
+  "lambda_init": 0.0,
+  "lambda_lr": 1.0,
+  "lambda_max": 100.0,
+  "dual_update_interval": 50,
+
+  "omega_init_path": "/root/paddlejob/share-storage/gpfs/system-public/dingxibo/PaddleFleet/Research/VHA-Warmup/scripts/dha_fusion/kv_cosine_groupings.json",
+  "omega_init_temperature": 5.0,
+
+  "log_interval": 20,
+  "gate_check_interval": 200,
+  "save_interval": 500,
+
+  "train_mode": "all"
+}
